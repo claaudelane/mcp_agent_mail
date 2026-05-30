@@ -64,6 +64,95 @@ from .storage import (
 )
 
 
+_SENSITIVE_FIELD_RE = re.compile(r"(token|secret|password|key)", re.IGNORECASE)
+
+
+def _redact_sensitive_text(text: str) -> str:
+    """Redact token-like values from validation/error text before it leaves HTTP."""
+
+    def _redact_jsonish_string(match: re.Match[str]) -> str:
+        return f'{match.group(1)}"<redacted>"'
+
+    def _redact_python_string(match: re.Match[str]) -> str:
+        return f"{match.group(1)}'<redacted>'"
+
+    def _redact_assignment(match: re.Match[str]) -> str:
+        return f"{match.group(1)}<redacted>"
+
+    # JSON/dict-shaped values: "sender_token": "..." or 'registration_token': '...'
+    text = re.sub(
+        r'((?:"[^"]*(?:token|secret|password|key)[^"]*")\s*:\s*)"[^"]*"',
+        _redact_jsonish_string,
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"((?:'[^']*(?:token|secret|password|key)[^']*')\s*:\s*)'[^']*'",
+        _redact_python_string,
+        text,
+        flags=re.IGNORECASE,
+    )
+    # Query/assignment-shaped values: agent_token=... or sender_token: ...
+    text = re.sub(
+        r"\b([A-Za-z0-9_.-]*(?:token|secret|password|key)[A-Za-z0-9_.-]*\s*[=:]\s*)[^\s,\"'&}\]\)]+",
+        _redact_assignment,
+        text,
+        flags=re.IGNORECASE,
+    )
+    # Pydantic text errors put the sensitive field on one line and input_value on the next.
+    text = re.sub(
+        r"(?i)(\b[A-Za-z0-9_.-]*(?:token|secret|password|key)[A-Za-z0-9_.-]*(?:\\n|\n)\s+.*?input_value=)(.*?)(,\s*input_type=)",
+        r"\1'<redacted>'\3",
+        text,
+    )
+    return text
+
+
+class SensitiveResponseRedactionMiddleware:
+    """Best-effort redaction for validation errors emitted below our tool layer."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        start_message: dict[str, Any] | None = None
+        body_parts: list[bytes] = []
+
+        async def send_wrapper(message: dict[str, Any]) -> None:
+            nonlocal start_message
+            if message["type"] == "http.response.start":
+                start_message = dict(message)
+                return
+            if message["type"] == "http.response.body":
+                body_parts.append(message.get("body", b""))
+                if message.get("more_body", False):
+                    return
+                body = b"".join(body_parts)
+                redacted = body
+                with contextlib.suppress(UnicodeDecodeError):
+                    text = body.decode("utf-8")
+                    safe_text = _redact_sensitive_text(text)
+                    if safe_text != text:
+                        redacted = safe_text.encode("utf-8")
+                if start_message is not None:
+                    headers = []
+                    for name, value in start_message.get("headers", []):
+                        if name.lower() == b"content-length":
+                            value = str(len(redacted)).encode("ascii")
+                        headers.append((name, value))
+                    start_message["headers"] = headers
+                    await send(start_message)
+                await send({**message, "body": redacted, "more_body": False})
+                return
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
 async def _project_slug_from_id(pid: int | None) -> str | None:
     if pid is None:
         return None
@@ -569,8 +658,31 @@ def _configure_logging(settings: Settings) -> None:
 
             return True
 
+    class SensitiveValueFilter(logging.Filter):
+        """Redact sensitive validation values before log handlers render them."""
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            message = record.getMessage()
+            redacted_message = _redact_sensitive_text(message)
+            if redacted_message != message:
+                record.msg = redacted_message
+                record.args = ()
+
+            if record.exc_info and record.exc_info[1] is not None:
+                exc_text = str(record.exc_info[1])
+                if _redact_sensitive_text(exc_text) != exc_text:
+                    # Avoid RichHandler rendering the original exception object,
+                    # whose Pydantic text can include rejected token values.
+                    record.exc_info = None
+                    record.exc_text = None
+                    if record.levelno >= logging.ERROR:
+                        record.levelno = logging.WARNING
+                        record.levelname = "WARNING"
+            return True
+
     # Apply filter to FastMCP's tool_manager logger
     fastmcp_logger = logging.getLogger("fastmcp.tools.tool_manager")
+    fastmcp_logger.addFilter(SensitiveValueFilter())
     fastmcp_logger.addFilter(ExpectedErrorFilter())
 
     # mark configured
@@ -1380,6 +1492,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             allow_localhost=bool(getattr(settings.http, "allow_localhost_unauthenticated", False)),
             public_get_paths=list(getattr(settings.http, "public_get_paths", []) or []),
         )
+    cast(Any, fastapi_app).add_middleware(SensitiveResponseRedactionMiddleware)
 
     # Optional CORS
     if settings.cors.enabled:
