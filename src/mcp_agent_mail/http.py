@@ -578,10 +578,17 @@ def _configure_logging(settings: Settings) -> None:
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app: FastAPI, token: str, allow_localhost: bool = False) -> None:
+    def __init__(
+        self,
+        app: FastAPI,
+        token: str,
+        allow_localhost: bool = False,
+        public_get_paths: list[str] | None = None,
+    ) -> None:
         super().__init__(app)
         self._token = token
         self._allow_localhost = allow_localhost
+        self._public_get_paths = tuple(p.rstrip("/") or "/" for p in (public_get_paths or []) if p.strip())
 
     @staticmethod
     def _is_localhost(host: str) -> bool:
@@ -607,6 +614,10 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if request.method == "OPTIONS":  # allow CORS preflight
             return await call_next(request)
         if request.url.path.startswith("/health/") or request.url.path == "/api/health":
+            return await call_next(request)
+        if request.method.upper() in {"GET", "HEAD"} and any(
+            request.url.path == path or request.url.path.startswith(path + "/") for path in self._public_get_paths
+        ):
             return await call_next(request)
         if _localhost_bypass_allowed(
             request,
@@ -1367,6 +1378,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             BearerAuthMiddleware,
             token=settings.http.bearer_token,
             allow_localhost=bool(getattr(settings.http, "allow_localhost_unauthenticated", False)),
+            public_get_paths=list(getattr(settings.http, "public_get_paths", []) or []),
         )
 
     # Optional CORS

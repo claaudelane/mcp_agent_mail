@@ -73,6 +73,7 @@ class HttpSettings:
     rbac_readonly_tools: list[str]
     # Dev convenience
     allow_localhost_unauthenticated: bool
+    public_get_paths: list[str]
 
 
 @dataclass(slots=True, frozen=True)
@@ -356,6 +357,7 @@ def _build_settings() -> Settings:
             default="health_check,fetch_inbox,whois,search_messages,summarize_thread",
         ),
         allow_localhost_unauthenticated=_bool(decouple_config("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", default="true"), default=True),
+        public_get_paths=_csv("HTTP_PUBLIC_GET_PATHS", default=""),
     )
 
     database_settings = DatabaseSettings(
