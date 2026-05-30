@@ -7,7 +7,7 @@ from httpx import ASGITransport, AsyncClient
 
 from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
-from mcp_agent_mail.http import _redact_sensitive_text, build_http_app
+from mcp_agent_mail.http import _looks_like_sensitive_error_payload, _redact_sensitive_text, build_http_app
 
 
 def _rpc(method: str, params: dict) -> dict:
@@ -127,3 +127,13 @@ def test_sensitive_redaction_preserves_json_uri_quotes():
     assert "secret-token-value" not in redacted
     assert "agent_token=<redacted>" in redacted
     assert '"mimeType":"application/json"' in redacted
+
+
+def test_response_redaction_skips_regular_message_bodies():
+    raw = (
+        '{"result":{"contents":[{"text":"{\\"body_md\\":\\"'
+        'export GITHUB_PERSONAL_ACCESS_TOKEN=$(launchctl getenv GITHUB_PERSONAL_ACCESS_TOKEN)'
+        '\\"}"}]}}'
+    )
+
+    assert _looks_like_sensitive_error_payload(raw) is False

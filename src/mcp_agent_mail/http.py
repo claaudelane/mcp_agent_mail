@@ -108,6 +108,17 @@ def _redact_sensitive_text(text: str) -> str:
     return text
 
 
+def _looks_like_sensitive_error_payload(text: str) -> bool:
+    """Return whether a response body looks like a validation/error surface."""
+    lowered = text.lower()
+    return (
+        "input_value=" in text
+        or "validationerror" in lowered
+        or "validation error for call[" in lowered
+        or '"iserror":true' in lowered.replace(" ", "")
+    )
+
+
 class SensitiveResponseRedactionMiddleware:
     """Best-effort redaction for validation errors emitted below our tool layer."""
 
@@ -135,9 +146,10 @@ class SensitiveResponseRedactionMiddleware:
                 redacted = body
                 with contextlib.suppress(UnicodeDecodeError):
                     text = body.decode("utf-8")
-                    safe_text = _redact_sensitive_text(text)
-                    if safe_text != text:
-                        redacted = safe_text.encode("utf-8")
+                    if _looks_like_sensitive_error_payload(text):
+                        safe_text = _redact_sensitive_text(text)
+                        if safe_text != text:
+                            redacted = safe_text.encode("utf-8")
                 if start_message is not None:
                     headers = []
                     for name, value in start_message.get("headers", []):
