@@ -177,6 +177,36 @@ class WindowIdentity(SQLModel, table=True):
     expires_ts: Optional[datetime] = Field(default=None)
 
 
+class LifecycleWatch(SQLModel, table=True):
+    """Auditable supervision state for compress, clear, and resume cycles."""
+
+    __tablename__ = "lifecycle_watches"
+    __table_args__ = (
+        Index("idx_lifecycle_watches_project_active", "project_id", "closed_ts", "due_ts"),
+        Index("idx_lifecycle_watches_subject_active", "subject_agent_id", "closed_ts", "due_ts"),
+        Index("idx_lifecycle_watches_supervisor_active", "supervisor_agent_id", "closed_ts", "due_ts"),
+        Index("idx_lifecycle_watches_session", "project_id", "session_id"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="projects.id", index=True)
+    subject_agent_id: int = Field(foreign_key="agents.id", index=True)
+    supervisor_agent_id: int = Field(foreign_key="agents.id", index=True)
+    session_id: str = Field(max_length=256, index=True)
+    phase: str = Field(default="watching", max_length=64)
+    status: str = Field(default="active", max_length=32)
+    next_action: str = Field(default="", max_length=2048)
+    last_event: str = Field(default="", max_length=4096)
+    details: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSON, nullable=False, server_default="{}"),
+    )
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+    updated_ts: datetime = Field(default_factory=_utcnow_naive)
+    due_ts: Optional[datetime] = Field(default=None)
+    closed_ts: Optional[datetime] = Field(default=None)
+
+
 class MessageSummary(SQLModel, table=True):
     """Stored on-demand project-wide message summary."""
 

@@ -63,7 +63,6 @@ from .storage import (
     write_file_reservation_record,
 )
 
-
 _SENSITIVE_FIELD_RE = re.compile(r"(token|secret|password|key)", re.IGNORECASE)
 
 

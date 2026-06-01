@@ -59,6 +59,7 @@ from .models import (
     Agent,
     AgentLink,
     FileReservation,
+    LifecycleWatch,
     Message,
     MessageRecipient,
     MessageSummary,
@@ -196,6 +197,7 @@ CLUSTER_MESSAGING = "messaging"
 CLUSTER_CONTACT = "contact"
 CLUSTER_SEARCH = "search"
 CLUSTER_FILE_RESERVATIONS = "file_reservations"
+CLUSTER_LIFECYCLE = "lifecycle"
 CLUSTER_MACROS = "workflow_macros"
 CLUSTER_BUILD_SLOTS = "build_slots"
 CLUSTER_PRODUCT = "product_bus"
@@ -219,7 +221,7 @@ TOOL_FILTER_PROFILES: dict[str, dict[str, list[str] | set[str]]] = {
         "tools": [],
     },
     "core": {
-        "clusters": [CLUSTER_IDENTITY, CLUSTER_MESSAGING, CLUSTER_FILE_RESERVATIONS, CLUSTER_MACROS],
+        "clusters": [CLUSTER_IDENTITY, CLUSTER_MESSAGING, CLUSTER_FILE_RESERVATIONS, CLUSTER_LIFECYCLE, CLUSTER_MACROS],
         "tools": ["health_check", "ensure_project"],
     },
     "minimal": {
@@ -1695,6 +1697,41 @@ def _agent_to_dict(agent: Agent) -> dict[str, Any]:
     if getattr(agent, "retired_at", None) is not None:
         d["retired_at"] = _iso(agent.retired_at)
     return d
+
+
+def _lifecycle_watch_to_dict(
+    watch: LifecycleWatch,
+    *,
+    subject_name: str | None = None,
+    supervisor_name: str | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    now_value = _naive_utc(now)
+    due_ts = _naive_utc(watch.due_ts) if watch.due_ts else None
+    closed_ts = _naive_utc(watch.closed_ts) if watch.closed_ts else None
+    overdue = bool(due_ts and closed_ts is None and due_ts < now_value)
+    data: dict[str, Any] = {
+        "id": watch.id,
+        "project_id": watch.project_id,
+        "subject_agent_id": watch.subject_agent_id,
+        "subject_agent": subject_name,
+        "supervisor_agent_id": watch.supervisor_agent_id,
+        "supervisor_agent": supervisor_name,
+        "session_id": watch.session_id,
+        "phase": watch.phase,
+        "status": watch.status,
+        "next_action": watch.next_action,
+        "last_event": watch.last_event,
+        "details": watch.details or {},
+        "created_ts": _iso(watch.created_ts),
+        "updated_ts": _iso(watch.updated_ts),
+        "due_ts": _iso(watch.due_ts) if watch.due_ts else None,
+        "closed_ts": _iso(watch.closed_ts) if watch.closed_ts else None,
+        "overdue": overdue,
+    }
+    if due_ts and closed_ts is None:
+        data["seconds_until_due"] = int((due_ts - now_value).total_seconds())
+    return data
 
 
 def _message_to_dict(message: Message, include_body: bool = True) -> dict[str, Any]:
@@ -6258,6 +6295,15 @@ def build_mcp_server() -> FastMCP:
             for wi in wis:
                 await session.delete(wi)
 
+            # Delete lifecycle watches
+            lw_rows = await session.execute(
+                select(LifecycleWatch).where(cast(Any, LifecycleWatch.project_id) == project_id)
+            )
+            watches = lw_rows.scalars().all()
+            deleted_counts["lifecycle_watches"] = len(watches)
+            for watch in watches:
+                await session.delete(watch)
+
             # Delete message summaries
             ms_rows = await session.execute(
                 select(MessageSummary).where(cast(Any, MessageSummary.project_id) == project_id)
@@ -6327,6 +6373,7 @@ def build_mcp_server() -> FastMCP:
             f"{deleted_counts.get('file_reservations', 0)} file reservations, "
             f"{deleted_counts.get('agent_links', 0)} agent links, "
             f"{deleted_counts.get('window_identities', 0)} window identities, "
+            f"{deleted_counts.get('lifecycle_watches', 0)} lifecycle watches, "
             f"{deleted_counts.get('message_summaries', 0)} message summaries, "
             f"{deleted_counts.get('sibling_suggestions', 0)} sibling suggestions, "
             f"{deleted_counts.get('product_links', 0)} product links removed.",
@@ -6725,6 +6772,327 @@ def build_mcp_server() -> FastMCP:
             "display_name": wi.display_name,
             "expired": True,
             "expired_at": _iso(now),
+        }
+
+    @mcp.tool(name="start_lifecycle_watch")
+    @_instrument_tool(
+        "start_lifecycle_watch",
+        cluster=CLUSTER_LIFECYCLE,
+        capabilities={"lifecycle", "write", "audit"},
+        project_arg="project_key",
+        agent_arg="supervisor_agent",
+    )
+    @retry_on_db_lock(max_retries=3, base_delay=0.05, max_delay=0.5)
+    async def start_lifecycle_watch(
+        ctx: Context,
+        project_key: str,
+        subject_agent: str,
+        supervisor_agent: str,
+        session_id: str,
+        phase: str = "watching",
+        next_action: str = "",
+        due_seconds: Optional[int] = None,
+        event: str = "",
+        details: Optional[dict[str, Any]] = None,
+        supervisor_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Start or refresh a durable lifecycle supervision watch between two agents.
+
+        Use this when one agent is responsible for keeping another moving through a
+        compress, clear, resume, and Q&A pass cycle. The record is project-scoped,
+        but it does not encode any host-specific assumptions, so the same flow can
+        supervise M4 panes, Chris VPS, Zima SSH lanes, and future Codex agents.
+        """
+        project = await _get_project_by_identifier(project_key)
+        supervisor = await _authenticate_agent(
+            ctx,
+            project,
+            supervisor_agent,
+            supervisor_token,
+            token_param="supervisor_token",
+            action="start_lifecycle_watch",
+        )
+        subject = await _get_agent(project, subject_agent)
+        clean_session_id = session_id.strip()
+        if not clean_session_id:
+            raise ToolExecutionError(
+                "INVALID_ARGUMENT",
+                "session_id cannot be empty.",
+                recoverable=True,
+                data={"parameter": "session_id"},
+            )
+        clean_phase = (phase or "watching").strip().lower().replace(" ", "_")
+        clean_event = (event or "").strip()
+        clean_next_action = (next_action or "").strip()
+        now = _naive_utc()
+        due_ts = now + timedelta(seconds=max(1, due_seconds)) if due_seconds is not None else None
+        async with get_session() as session:
+            existing_result = await session.execute(
+                select(LifecycleWatch).where(
+                    cast(Any, LifecycleWatch.project_id == project.id),
+                    cast(Any, LifecycleWatch.subject_agent_id == subject.id),
+                    cast(Any, LifecycleWatch.supervisor_agent_id == supervisor.id),
+                    cast(Any, LifecycleWatch.session_id == clean_session_id),
+                    cast(Any, LifecycleWatch.closed_ts).is_(None),
+                ).order_by(desc(cast(Any, LifecycleWatch.updated_ts)), desc(cast(Any, LifecycleWatch.id)))
+            )
+            watch = existing_result.scalars().first()
+            if watch is None:
+                watch = LifecycleWatch(
+                    project_id=cast(int, project.id),
+                    subject_agent_id=cast(int, subject.id),
+                    supervisor_agent_id=cast(int, supervisor.id),
+                    session_id=clean_session_id,
+                    created_ts=now,
+                )
+            watch.phase = clean_phase
+            watch.status = "active"
+            watch.next_action = clean_next_action
+            watch.last_event = clean_event
+            watch.details = details or {}
+            watch.updated_ts = now
+            watch.due_ts = due_ts
+            watch.closed_ts = None
+            session.add(watch)
+            await session.commit()
+            await session.refresh(watch)
+        await ctx.info(
+            f"Lifecycle watch active: supervisor '{supervisor.name}' -> subject '{subject.name}' "
+            f"for session '{clean_session_id}' phase '{clean_phase}'."
+        )
+        return {
+            "status": "active",
+            "watch": _lifecycle_watch_to_dict(
+                watch,
+                subject_name=subject.name,
+                supervisor_name=supervisor.name,
+                now=now,
+            ),
+        }
+
+    @mcp.tool(name="update_lifecycle_watch")
+    @_instrument_tool(
+        "update_lifecycle_watch",
+        cluster=CLUSTER_LIFECYCLE,
+        capabilities={"lifecycle", "write", "audit"},
+        project_arg="project_key",
+        agent_arg="actor_agent",
+    )
+    @retry_on_db_lock(max_retries=3, base_delay=0.05, max_delay=0.5)
+    async def update_lifecycle_watch(
+        ctx: Context,
+        project_key: str,
+        subject_agent: str,
+        supervisor_agent: str,
+        session_id: str,
+        actor_agent: Optional[str] = None,
+        phase: Optional[str] = None,
+        status: str = "active",
+        event: str = "",
+        next_action: Optional[str] = None,
+        due_seconds: Optional[int] = None,
+        details: Optional[dict[str, Any]] = None,
+        actor_token: Optional[str] = None,
+        close: bool = False,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Update lifecycle supervision progress from either side of the pair.
+
+        The actor must authenticate as the supervisor or the subject. This makes
+        the follow-through contract reciprocal: the watched agent can report
+        `READY_FOR_PASS`, while the supervisor can report `PASS`, overdue, or a
+        correction without waiting for a separate side channel.
+        """
+        project = await _get_project_by_identifier(project_key)
+        subject = await _get_agent(project, subject_agent)
+        supervisor = await _get_agent(project, supervisor_agent)
+        clean_actor = (actor_agent or supervisor_agent).strip()
+        actor = await _authenticate_agent(
+            ctx,
+            project,
+            clean_actor,
+            actor_token,
+            token_param="actor_token",
+            action="update_lifecycle_watch",
+        )
+        if actor.id not in {subject.id, supervisor.id}:
+            raise ToolExecutionError(
+                "LIFECYCLE_ACTOR_NOT_IN_WATCH",
+                "Lifecycle watch updates must come from the subject or supervisor.",
+                recoverable=True,
+                data={
+                    "actor_agent": actor.name,
+                    "subject_agent": subject.name,
+                    "supervisor_agent": supervisor.name,
+                },
+            )
+        clean_session_id = session_id.strip()
+        if not clean_session_id:
+            raise ToolExecutionError(
+                "INVALID_ARGUMENT",
+                "session_id cannot be empty.",
+                recoverable=True,
+                data={"parameter": "session_id"},
+            )
+        clean_status = (status or "active").strip().lower().replace(" ", "_")
+        clean_phase = phase.strip().lower().replace(" ", "_") if phase else None
+        terminal_statuses = {"pass", "passed", "complete", "completed", "closed", "failed", "fail", "cancelled"}
+        now = _naive_utc()
+        due_ts = now + timedelta(seconds=max(1, due_seconds)) if due_seconds is not None else None
+        async with get_session() as session:
+            result = await session.execute(
+                select(LifecycleWatch).where(
+                    cast(Any, LifecycleWatch.project_id == project.id),
+                    cast(Any, LifecycleWatch.subject_agent_id == subject.id),
+                    cast(Any, LifecycleWatch.supervisor_agent_id == supervisor.id),
+                    cast(Any, LifecycleWatch.session_id == clean_session_id),
+                    cast(Any, LifecycleWatch.closed_ts).is_(None),
+                ).order_by(desc(cast(Any, LifecycleWatch.updated_ts)), desc(cast(Any, LifecycleWatch.id)))
+            )
+            watch = result.scalars().first()
+            if watch is None:
+                raise ToolExecutionError(
+                    "LIFECYCLE_WATCH_NOT_FOUND",
+                    "No active lifecycle watch matched the project, subject, supervisor, and session_id.",
+                    recoverable=True,
+                    data={
+                        "project_key": project.human_key,
+                        "subject_agent": subject.name,
+                        "supervisor_agent": supervisor.name,
+                        "session_id": clean_session_id,
+                    },
+                )
+            if clean_phase is not None:
+                watch.phase = clean_phase
+            watch.status = clean_status
+            watch.last_event = (event or "").strip()
+            if next_action is not None:
+                watch.next_action = next_action.strip()
+            if details is not None:
+                watch.details = details
+            if due_seconds is not None:
+                watch.due_ts = due_ts
+            watch.updated_ts = now
+            if close or clean_status in terminal_statuses:
+                watch.closed_ts = now
+            session.add(watch)
+            await session.commit()
+            await session.refresh(watch)
+        await ctx.info(
+            f"Lifecycle watch updated by '{actor.name}': subject '{subject.name}', "
+            f"supervisor '{supervisor.name}', status '{clean_status}'."
+        )
+        return {
+            "status": clean_status,
+            "watch": _lifecycle_watch_to_dict(
+                watch,
+                subject_name=subject.name,
+                supervisor_name=supervisor.name,
+                now=now,
+            ),
+        }
+
+    @mcp.tool(name="list_lifecycle_watches")
+    @_instrument_tool(
+        "list_lifecycle_watches",
+        cluster=CLUSTER_LIFECYCLE,
+        capabilities={"lifecycle", "read", "audit"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+        complexity="low",
+    )
+    async def list_lifecycle_watches(
+        ctx: Context,
+        project_key: str,
+        agent_name: Optional[str] = None,
+        role: str = "any",
+        active_only: bool = True,
+        overdue_only: bool = False,
+        limit: int = 50,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        List lifecycle supervision watches for dashboards and watcher loops.
+
+        `agent_name` can filter by subject, supervisor, or either role. With
+        `overdue_only=true`, operators can find agents that are ready but stuck
+        waiting for their partner to complete the lifecycle cycle.
+        """
+        project = await _get_project_by_identifier(project_key)
+        now = _naive_utc()
+        capped_limit = max(1, min(200, limit))
+        role_value = (role or "any").strip().lower()
+        if role_value not in {"any", "subject", "supervisor"}:
+            raise ToolExecutionError(
+                "INVALID_ARGUMENT",
+                "role must be one of: any, subject, supervisor.",
+                recoverable=True,
+                data={"parameter": "role", "provided": role},
+            )
+        filter_agent: Agent | None = None
+        if agent_name:
+            filter_agent = await _get_agent(project, agent_name)
+        async with get_session() as session:
+            conditions: list[Any] = [cast(Any, LifecycleWatch.project_id == project.id)]
+            if active_only:
+                conditions.append(cast(Any, LifecycleWatch.closed_ts).is_(None))
+            if overdue_only:
+                conditions.extend([
+                    cast(Any, LifecycleWatch.closed_ts).is_(None),
+                    cast(Any, LifecycleWatch.due_ts).is_not(None),
+                    cast(Any, LifecycleWatch.due_ts) < now,
+                ])
+            if filter_agent is not None:
+                if role_value == "subject":
+                    conditions.append(cast(Any, LifecycleWatch.subject_agent_id == filter_agent.id))
+                elif role_value == "supervisor":
+                    conditions.append(cast(Any, LifecycleWatch.supervisor_agent_id == filter_agent.id))
+                else:
+                    conditions.append(
+                        or_(
+                            cast(Any, LifecycleWatch.subject_agent_id == filter_agent.id),
+                            cast(Any, LifecycleWatch.supervisor_agent_id == filter_agent.id),
+                        )
+                    )
+            result = await session.execute(
+                select(LifecycleWatch)
+                .where(*conditions)
+                .order_by(desc(cast(Any, LifecycleWatch.updated_ts)), desc(cast(Any, LifecycleWatch.id)))
+                .limit(capped_limit)
+            )
+            watches = result.scalars().all()
+            agent_ids: set[int] = set()
+            for watch in watches:
+                agent_ids.add(watch.subject_agent_id)
+                agent_ids.add(watch.supervisor_agent_id)
+            names_by_id: dict[int, str] = {}
+            if agent_ids:
+                agents_result = await session.execute(
+                    select(Agent).where(cast(Any, Agent.id).in_(agent_ids))
+                )
+                names_by_id = {
+                    cast(int, agent.id): agent.name
+                    for agent in agents_result.scalars().all()
+                    if agent.id is not None
+                }
+        items = [
+            _lifecycle_watch_to_dict(
+                watch,
+                subject_name=names_by_id.get(watch.subject_agent_id),
+                supervisor_name=names_by_id.get(watch.supervisor_agent_id),
+                now=now,
+            )
+            for watch in watches
+        ]
+        overdue_count = sum(1 for item in items if item["overdue"])
+        return {
+            "project_key": project.human_key,
+            "count": len(items),
+            "overdue_count": overdue_count,
+            "watches": items,
         }
 
     @mcp.tool(name="send_message")
@@ -12590,6 +12958,39 @@ def build_mcp_server() -> FastMCP:
                 ],
             },
             {
+                "name": "Lifecycle Supervision",
+                "purpose": "Track reciprocal compress, clear, resume, and Q&A follow-through across agents.",
+                "tools": [
+                    {
+                        "name": "start_lifecycle_watch",
+                        "summary": "Create or refresh an active supervision watch between a subject and supervisor.",
+                        "use_when": "An agent enters a lifecycle boundary or a supervisor takes responsibility for clearing/resuming it.",
+                        "related": ["update_lifecycle_watch", "list_lifecycle_watches"],
+                        "expected_frequency": "At each supervised lifecycle boundary.",
+                        "required_capabilities": ["lifecycle", "audit"],
+                        "usage_examples": [{"hint": "Start watch", "sample": "start_lifecycle_watch(project_key='fleet', subject_agent='felix-m4', supervisor_agent='frances-m4', session_id='felix-2026-06-01', phase='resume_gate')"}],
+                    },
+                    {
+                        "name": "update_lifecycle_watch",
+                        "summary": "Record progress, pass/fail, next action, or close state from either side of a watch.",
+                        "use_when": "The subject reaches READY_FOR_PASS or the supervisor issues PASS/correction.",
+                        "related": ["start_lifecycle_watch", "list_lifecycle_watches"],
+                        "expected_frequency": "Whenever lifecycle state changes.",
+                        "required_capabilities": ["lifecycle", "audit"],
+                        "usage_examples": [{"hint": "Record pass", "sample": "update_lifecycle_watch(project_key='fleet', subject_agent='felix-m4', supervisor_agent='frances-m4', session_id='felix-2026-06-01', status='pass', close=true)"}],
+                    },
+                    {
+                        "name": "list_lifecycle_watches",
+                        "summary": "List active or overdue lifecycle watches for operators and watcher loops.",
+                        "use_when": "Checking whether any agent is waiting on a supervisor or subject.",
+                        "related": ["start_lifecycle_watch", "update_lifecycle_watch"],
+                        "expected_frequency": "Periodic polling by dashboards/watchers.",
+                        "required_capabilities": ["lifecycle", "read", "audit"],
+                        "usage_examples": [{"hint": "Find stuck waits", "sample": "list_lifecycle_watches(project_key='fleet', overdue_only=true)"}],
+                    },
+                ],
+            },
+            {
                 "name": "Contact Governance",
                 "purpose": "Manage messaging permissions when policies are not open by default.",
                 "tools": [
@@ -12757,6 +13158,10 @@ def build_mcp_server() -> FastMCP:
             {
                 "workflow": "Manage contact approvals",
                 "sequence": ["set_contact_policy", "request_contact", "respond_contact", "send_message"],
+            },
+            {
+                "workflow": "Supervise lifecycle boundary",
+                "sequence": ["start_lifecycle_watch", "list_lifecycle_watches", "update_lifecycle_watch"],
             },
         ]
 
