@@ -49,6 +49,41 @@ remote-only file must be attached, first place it somewhere the MCP server can
 resolve, or send the content through another approved transfer path and attach
 the server-visible copy.
 
+## OP shared attachment surface
+
+For fleet OP use, attachment bytes that remote agents need to open must be
+available on the shared NextLife surface, not only in the M4 user's local Agent
+Mail storage.
+
+Current shared path:
+
+```text
+/Volumes/NextLife/Agents/shared/agent-mail/projects/volumes-nextlife-agents-m4/attachments/
+```
+
+Chris VPS sees that path through SSHFS as:
+
+```text
+/home/ubuntu/.openclaw/workspace/repos/chris/inbox/m4-nextlife/Agents/shared/agent-mail/projects/volumes-nextlife-agents-m4/attachments/
+```
+
+For message `355`, Chris verified this attachment path:
+
+```text
+/home/ubuntu/.openclaw/workspace/repos/chris/inbox/m4-nextlife/Agents/shared/agent-mail/projects/volumes-nextlife-agents-m4/attachments/files/23/23fe3b16a65fa5f8f546680c781a4d7075797a4a7ef14ae8f24cfd5dabbf13ed.md
+```
+
+Expected hash:
+
+```text
+23fe3b16a65fa5f8f546680c781a4d7075797a4a7ef14ae8f24cfd5dabbf13ed
+```
+
+Do not replace the local mailbox archive `attachments/` directory with a symlink
+inside the Git mailbox. Git treats that as deleted files plus a symlink and it
+can break future archive commits. Use an OP mirror/copy for shared access unless
+the whole storage root is migrated in a planned maintenance window.
+
 ## Send a Markdown attachment
 
 Use `send_message` with `attachment_paths`.
@@ -128,6 +163,8 @@ For the June 1, 2026 smoke:
 - Chris VPS sent reply `352` with a Markdown attachment.
 - Frances independently verified message `351` and replied PASS in `354`.
 - Chris's OpenClaw pane later re-tested from `repos/chris` and reported PASS.
+- Chris later verified message `355` attachment content through the shared OP
+  NextLife path and reported PASS from his OpenClaw pane.
 
 ## Guardrails
 
