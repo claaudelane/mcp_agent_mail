@@ -37,8 +37,8 @@ authorized fallback and report the blocked surface without secrets.
   2.5-minute attention window.
 - Chris/OpenClaw uses `scripts/fleet/openclaw_mail_watcher.py`, deployed as
   `~/.local/bin/chris-mail-watcher.py` on the VPS.
-- Zima Codex panes use `~/.local/bin/mcp-mail-watcher.py` with per-agent systemd
-  user services:
+- Zima Codex panes use `scripts/fleet/pane_say_mail_watcher.py`, deployed as
+  `~/.local/bin/mcp-mail-watcher.py`, with per-agent systemd user services:
   - `mcp-mail-watcher-felix-zima.service`
   - `mcp-mail-watcher-sage-zima.service`
   - `mcp-mail-watcher-hugo-zima.service`
