@@ -1253,3 +1253,46 @@ async def test_store_image_sha256_via_mcp_send_message(isolated_env, monkeypatch
             assert full_path.exists(), f"webp at {att_path} not found on disk"
 
     img_path.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_markdown_attachment_path_via_mcp_send_message(isolated_env):
+    """send_message stores Markdown attachment_paths as generic file attachments."""
+    settings = get_settings()
+    storage_root = Path(settings.storage.root).expanduser().resolve()
+    archive_source = storage_root / "projects" / "backend" / "docs"
+    archive_source.mkdir(parents=True, exist_ok=True)
+    md_path = archive_source / "smoke.md"
+    md_path.write_text("# Smoke\n\nMarkdown attachment body.\n", encoding="utf-8")
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool(
+            "register_agent",
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+        )
+        res = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "Backend",
+                "sender_name": "BlueLake",
+                "to": ["BlueLake"],
+                "subject": "Markdown attachment test",
+                "body_md": "Please read the attached Markdown.",
+                "attachment_paths": ["docs/smoke.md"],
+            },
+        )
+
+    deliveries = res.data.get("deliveries") or []
+    assert deliveries, "at least one delivery expected"
+    attachments = deliveries[0].get("payload", {}).get("attachments") or []
+    assert len(attachments) == 1
+    att = attachments[0]
+    assert att["type"] == "file"
+    assert att["media_type"] in {"text/markdown", "text/x-markdown", "text/plain"}
+    assert att["filename"] == "smoke.md"
+    assert len(att["sha1"]) == 64
+    stored_path = storage_root / att["path"]
+    assert stored_path.exists()
+    assert stored_path.read_text(encoding="utf-8") == "# Smoke\n\nMarkdown attachment body.\n"

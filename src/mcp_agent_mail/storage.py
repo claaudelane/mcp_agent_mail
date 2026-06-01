@@ -21,6 +21,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import mimetypes
 import os
 import random
 import re
@@ -37,7 +38,7 @@ from typing import Any, AsyncIterator, Iterable, Sequence, TypeVar, cast
 from filelock import SoftFileLock, Timeout
 from git import Actor, Repo
 from git.objects.tree import Tree
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from .config import Settings
 from .db import get_sqlite_pre_restore_path, get_sqlite_sidecar_paths
@@ -1785,7 +1786,7 @@ async def process_attachments(
                 resolved = await _to_thread(_expanduser_resolve_path, p)
             else:
                 resolved = _resolve_archive_relative_path(archive, path)
-            meta, rel_path = await _store_image(archive, resolved, embed_policy=embed_policy)
+            meta, rel_path = await _store_attachment(archive, resolved, embed_policy=embed_policy)
             attachments_meta.append(meta)
             if rel_path:
                 commit_paths.append(rel_path)
@@ -1969,6 +1970,72 @@ async def _store_image(archive: ProjectArchive, path: Path, *, embed_policy: str
     finally:
         # Close the converted image to prevent file handle leaks
         img.close()
+
+
+def _safe_attachment_suffix(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if not suffix or len(suffix) > 16:
+        return ".bin"
+    if not re.fullmatch(r"\.[a-z0-9][a-z0-9._-]*", suffix):
+        return ".bin"
+    return suffix
+
+
+async def _store_file_attachment(archive: ProjectArchive, path: Path) -> tuple[dict[str, object], str | None]:
+    data = await _to_thread(path.read_bytes)
+    digest = hashlib.sha256(data).hexdigest()
+    suffix = _safe_attachment_suffix(path)
+    target_dir = archive.attachments_dir / "files" / digest[:2]
+    await _to_thread(target_dir.mkdir, parents=True, exist_ok=True)
+    target_path = target_dir / f"{digest}{suffix}"
+    if not target_path.exists():
+        await _to_thread(target_path.write_bytes, data)
+
+    rel_path = target_path.relative_to(archive.repo_root).as_posix()
+    media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    meta: dict[str, object] = {
+        "type": "file",
+        "media_type": media_type,
+        "bytes": len(data),
+        "path": rel_path,
+        "sha1": digest,
+        "filename": path.name,
+    }
+    try:
+        manifest_dir = archive.root / "attachments" / "_manifests"
+        await _to_thread(manifest_dir.mkdir, parents=True, exist_ok=True)
+        manifest_path = manifest_dir / f"{digest}.json"
+        manifest_payload = {
+            "sha1": digest,
+            "path": rel_path,
+            "bytes": len(data),
+            "media_type": media_type,
+            "filename": path.name,
+            "original_ext": suffix,
+        }
+        await _write_json(manifest_path, manifest_payload)
+        await _append_attachment_audit(
+            archive,
+            digest,
+            {
+                "event": "stored",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "path": rel_path,
+                "bytes": len(data),
+                "media_type": media_type,
+                "ext": suffix,
+            },
+        )
+    except Exception:
+        pass
+    return meta, rel_path
+
+
+async def _store_attachment(archive: ProjectArchive, path: Path, *, embed_policy: str = "auto") -> tuple[dict[str, object], str | None]:
+    try:
+        return await _store_image(archive, path, embed_policy=embed_policy)
+    except UnidentifiedImageError:
+        return await _store_file_attachment(archive, path)
 
 
 async def _save_webp(img: Image.Image, path: Path) -> None:

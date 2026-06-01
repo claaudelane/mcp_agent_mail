@@ -7155,7 +7155,8 @@ def build_mcp_server() -> FastMCP:
         cc, bcc : Optional[list[str]]
             Additional recipients by name.
         attachment_paths : Optional[list[str]]
-            Extra file paths to include as attachments; will be converted to WebP and stored.
+            Extra file paths to include as attachments. Images are converted to WebP;
+            other files are stored as content-addressed file attachments.
         convert_images : Optional[bool]
             Overrides server default for image conversion/inlining. If None, server settings apply.
             Note: sender attachments_policy "inline"/"file" always forces conversion/inlining.
