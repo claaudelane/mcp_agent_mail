@@ -18,7 +18,7 @@
 #   AGENT_MAIL_REGISTRATION_TOKEN  - Per-agent registration_token. Required for fetch_inbox
 #                                    when called outside an authenticated MCP session, which
 #                                    is always the case here (each notify fires its own POST).
-#   AGENT_MAIL_INTERVAL            - Minimum seconds between checks (default: 120)
+#   AGENT_MAIL_INTERVAL            - Minimum seconds between checks (default: 45)
 #   AGENT_MAIL_LIFECYCLE_WATCHES   - Also remind about active lifecycle watches (default: 1)
 
 # Don't use set -e because grep returns 1 when no match
@@ -34,7 +34,7 @@ AGENT="${AGENT_MAIL_AGENT:-}"
 URL="${AGENT_MAIL_URL:-http://127.0.0.1:8765/api/}"
 TOKEN="${AGENT_MAIL_TOKEN:-}"
 REG_TOKEN="${AGENT_MAIL_REGISTRATION_TOKEN:-}"
-INTERVAL="${AGENT_MAIL_INTERVAL:-120}"
+INTERVAL="${AGENT_MAIL_INTERVAL:-45}"
 LIFECYCLE_WATCHES="${AGENT_MAIL_LIFECYCLE_WATCHES:-1}"
 
 # Require project and agent

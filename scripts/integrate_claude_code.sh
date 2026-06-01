@@ -177,7 +177,7 @@ log_step "Writing MCP server config and hooks (merge, not overwrite)"
 # any persistent MCP-session state). AGENT_MAIL_HOOK_FORMAT=json makes the
 # reminder land in the agent's next-turn system-reminder context — plain
 # stdout is shown to the human in the terminal but never reaches the agent.
-INBOX_CHECK_CMD="AGENT_MAIL_PROJECT='${TARGET_DIR}' AGENT_MAIL_AGENT='${_AGENT}' AGENT_MAIL_URL='${_URL}' AGENT_MAIL_TOKEN='${_TOKEN}' AGENT_MAIL_REGISTRATION_TOKEN='${_REG_TOKEN:-}' AGENT_MAIL_HOOK_FORMAT='json' AGENT_MAIL_INTERVAL='120' '${INBOX_HOOK}'"
+INBOX_CHECK_CMD="AGENT_MAIL_PROJECT='${TARGET_DIR}' AGENT_MAIL_AGENT='${_AGENT}' AGENT_MAIL_URL='${_URL}' AGENT_MAIL_TOKEN='${_TOKEN}' AGENT_MAIL_REGISTRATION_TOKEN='${_REG_TOKEN:-}' AGENT_MAIL_HOOK_FORMAT='json' AGENT_MAIL_INTERVAL='45' '${INBOX_HOOK}'"
 
 # ============================================================================
 # settings.json: HOOKS ONLY (no secrets, git-tracked)
